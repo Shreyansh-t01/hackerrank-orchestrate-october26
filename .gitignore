@@ -1,0 +1,18 @@
+# Python Cache
+__pycache__/
+*.py[cod]
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Secrets and Configs
+.env
+
+# Logs
+log.txt
+*.log
+
+# Data
+dataset/
