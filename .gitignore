@@ -16,3 +16,6 @@ log.txt
 
 # Data
 dataset/
+/data/
+/output.sample.csv
+/output.case_*.csv

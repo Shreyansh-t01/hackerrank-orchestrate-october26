@@ -23,7 +23,25 @@ cd hackerrank-orchestrate-october26
 
 Start your AI coding tool from the **repository root** so it automatically reads [`AGENTS.md`](./AGENTS.md) and logs your session turns to `log.txt` in the root directory.
 
-Build your solution in `code/main.py`, or use another language and document its setup and run command clearly in your README.
+The implementation is organized into small modules under `code/`. Read [`IMPLEMENTATION_GUIDE.md`](./IMPLEMENTATION_GUIDE.md) for a plain-language walkthrough of how the parts connect.
+
+Install the Python dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Create a local environment file from the example and add your API key:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Install the Tesseract OCR executable separately and place it on `PATH`; set optional `TESSERACT_CMD` in `.env` if it is installed elsewhere. PyMuPDF reads selectable PDF text directly. Tesseract reads scanned PDF pages and images locally. Gemini is used only afterward to interpret extracted text into evidence records; it never receives image bytes or runs just to extract text. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) for intent classification and semantic document interpretation. `GEMINI_DOCUMENT_TEXT_TIMEOUT_SECONDS` defaults to 60 and `GEMINI_DOCUMENT_MAX_RETRIES` defaults to 2 additional retries. `GEMINI_INTENT_MAX_RETRIES` controls intent classification. `.env` is ignored by Git; keep credentials out of `.env.example`.
+
+LLM transport and settings live under `code/llm/`. Feature prompts live with the feature that uses them: intent classification owns its prompt in `code/intent_classifier.py`, and document evidence interpretation owns its prompt in `code/evidence_parsers/document_text.py`. Deterministic extraction is a separate function in that parser; text-model calls are usage-tracked by the shared LLM transport.
+
+Evidence collection names and service-export tables are normalized in `code/data_catalog.py` to the categories in `deletion_rules.csv`. Unmapped categories count as an evidence-coverage gap and cannot silently be treated as a completed parse.
 
 Your solution must:
 
@@ -31,13 +49,27 @@ Your solution must:
 - Generate one prediction row for every request in `dataset/deletion_requests.csv`
 - Write the final predictions to `output.csv` in the repository root
 
-Run the starter Python entry point with:
+Run the full audit from the repository root with:
 
 ```bash
 python3 code/main.py
 ```
 
+The first run builds the local SQLite index. Unchanged PDFs and images reuse cached text interpretations in `data/document_text_cache/`. Each interpreted record retains its evidence ID, source filename link, capture timestamp, and page number. `--rebuild-index --index-only --db data/resource_index_candidate.db` rebuilds and checks the index without auditing cases or writing `output.csv`. `--sample` and `--case case_07` write separate debug CSV files and do not overwrite the final `output.csv`.
+
+Operational run events are appended to `data/audit_runtime.jsonl`; the logger keeps only allow-listed metadata and does not store request contents or personal identifiers.
+
 The blank template at `dataset/output.csv` is provided as a reference. Your final generated file for submission must be the root-level `output.csv`.
+
+## Tests
+
+Unit tests use Python's standard `unittest` runner:
+
+```bash
+python -m unittest discover -s tests
+```
+
+The unit tests are in `tests/` and can be run with the command above.
 
 
 ## Dataset
@@ -89,14 +121,14 @@ The final file must contain 518 data rows sorted by `case_id` (plus the header r
 Your `code.zip` must include:
 
 ```text
-code/evaluation/evaluation_report.md
-code/evaluation/usage_report.md
+evaluation/evaluation_report.md
+evaluation/usage_report.md
 ```
 
 - `evaluation_report.md` must cover case, row, field, and sequence accuracy, at least three additional evaluation cases created by you, failures found, and improvements made.
 - `usage_report.md` must cover the final full-dataset run, including model providers and names, model calls, input and output tokens, total and average tokens per request, and estimated total and per-request cost. Include per-model and overall totals when using multiple models.
 
-**Important:** Place `evaluation_report.md` and `usage_report.md` inside `code/evaluation/` (matching `code/evaluation/main.py` in this starter layout), write your complete evaluation metrics, custom evaluation test cases, and token/cost breakdowns directly inside those Markdown files, and keep prompts in source code or Markdown files. Automated code evaluation ignores raw data files (`.csv`, `.tsv`, `.json`, `.jsonl`, `.sql`, `.log`), so content stored only in those formats will not be visible to the code judge or AI interviewer.
+**Important:** Place `evaluation_report.md` and `usage_report.md` in the repository-root `evaluation/` folder. The runner writes them after a successful full-dataset run. Keep prompts in source code or Markdown files. Automated code evaluation ignores raw data files (`.csv`, `.tsv`, `.json`, `.jsonl`, `.sql`, `.log`), so content stored only in those formats will not be visible to the code judge or AI interviewer.
 
 ---
 
@@ -131,18 +163,18 @@ To package `code.zip` from the repository root without bundling the dataset:
 **macOS / Linux:**
 
 ```bash
-zip -r code.zip README.md code -x "*/__pycache__/*" "*/.venv/*" "*/venv/*" "*/node_modules/*" "*/.git/*" "*/.DS_Store"
+zip -r code.zip README.md IMPLEMENTATION_GUIDE.md .env.example requirements.txt code tests evaluation -x "*/__pycache__/*" "*/.venv/*" "*/venv/*" "*/node_modules/*" "*/.git/*" "*/.DS_Store"
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-Compress-Archive -Path README.md, code -DestinationPath code.zip -Force
+Compress-Archive -Path README.md, IMPLEMENTATION_GUIDE.md, .env.example, requirements.txt, code, tests, evaluation -DestinationPath code.zip -Force
 ```
 
 When packaging `code.zip`:
 
-- Keep your evaluation reports in `code/evaluation/` so they are bundled automatically with `code` (or add `evaluation` to the archive command above if you placed them in a top-level `evaluation/` directory).
+- Keep your evaluation reports in the repository-root `evaluation/` folder so they are included in `code.zip`.
 - Do **not** include `dataset/`, virtual environments (`.venv`, `venv`, `node_modules`), or build caches (`__pycache__`). On Windows, keep `.venv` at the repository root (outside `code/`) and remove any `code/__pycache__` folders before running `Compress-Archive`.
 - Do **not** include nested archives (`.zip`, `.tar`, `.gz`, `.tgz`, `.7z`, `.rar`) inside `code.zip` — submissions containing nested archive files will be rejected.
 
@@ -152,6 +184,6 @@ Before submitting, confirm that:
 - every `steps_json` value is a valid JSON array with consecutive step numbers starting at `1`;
 - findings cite valid evidence IDs, and `COMPLETE` verification steps cite evidence proving the current state;
 - proposed remediation and future verification steps use an empty `evidence_id` (`""`);
-- `code.zip` includes your runnable code, `README.md`, `code/evaluation/evaluation_report.md`, and `code/evaluation/usage_report.md`;
+- `code.zip` includes your runnable code, `README.md`, `evaluation/evaluation_report.md`, and `evaluation/usage_report.md`;
 - `log.txt` follows the `AGENTS.md` turn format and is uploaded to the `chat_transcript` slot; and
 - no API keys, credentials, real personal data, or sensitive configuration values are included.

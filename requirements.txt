@@ -1,0 +1,6 @@
+requests
+langgraph
+typing_extensions
+PyMuPDF>=1.26,<2
+pytesseract>=0.3.13,<1
+Pillow>=10,<14

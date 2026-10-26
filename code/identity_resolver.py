@@ -2,8 +2,8 @@
 Temporal Identity Graph & Resolver Module for Deletion Auditing.
 
 Reconstructs current and historical user identities using a temporal graph with
-valid-time intervals [valid_from, valid_to), point-in-time audit cutoffs,
-and temporal BFS traversal to prevent identity bleed and resolve recycled identifiers.
+valid-time intervals [valid_from, valid_to) and point-in-time audit cutoffs.
+Identity links are read from the selected user's own edges to prevent identity bleed.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import re
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -117,6 +117,22 @@ class ResolvedIdentity:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert resolved identity to serializable dictionary."""
+        identifiers = [
+            {
+                "type": "user_id", "value": self.user_id,
+                "normalized_value": self.user_id.strip().lower(),
+                "valid_from": None, "valid_to": None, "evidence_id": "",
+            }
+        ]
+        for item in self.timeline_intervals:
+            identifiers.append({
+                "type": item["node_type"].lower(),
+                "value": item["value"],
+                "normalized_value": item.get("normalized_value", str(item["value"]).strip().lower()),
+                "valid_from": item["valid_from"],
+                "valid_to": item["valid_to"],
+                "evidence_id": item.get("audit_id", ""),
+            })
         return {
             "user_id": self.user_id,
             "name": self.name,
@@ -125,6 +141,10 @@ class ResolvedIdentity:
             "all_phones": sorted(list(self.all_phones)),
             "phone_digits": sorted(list(self.phone_digits)),
             "all_email_hashes": sorted(list(self.all_email_hashes)),
+            "all_identifiers": sorted({
+                self.user_id, *self.all_emails, *self.all_phones, *self.phone_digits, *self.all_email_hashes
+            }),
+            "identifiers": identifiers,
             "timeline_intervals": self.timeline_intervals,
         }
 
@@ -200,7 +220,7 @@ class TemporalIdentityGraph:
 class TemporalIdentityResolver:
     """
     High-level resolver that builds point-in-time temporal identity graphs
-    and performs constrained traversals starting from input emails.
+        and resolves the owner of an input email at its request timestamp.
     """
 
     def __init__(
@@ -266,9 +286,10 @@ class TemporalIdentityResolver:
                 graph.add_edge(user_node_id, name_node_id, "HAS_NAME")
 
             # Process fields: email, phone, email_hash
+            snapshot_updated_at = parse_iso_timestamp(u.get("updated_at"))
             fields_to_process = [
                 ("email", "EMAIL", normalize_email(u.get("email")), u.get("email", "")),
-                ("phone", "PHONE", u.get("phone", "").strip(), u.get("phone", "")),
+                ("phone", "PHONE", clean_phone_digits(u.get("phone", "")), u.get("phone", "")),
                 ("email_hash", "EMAIL_HASH", u.get("email_hash", "").strip().lower(), u.get("email_hash", "")),
             ]
 
@@ -276,18 +297,35 @@ class TemporalIdentityResolver:
                 events = user_field_events.get((user_id, field_name), [])
 
                 if not events:
-                    # No historical changes: current value was valid indefinitely
+                    # The current snapshot cannot establish a value before its update time.
+                    if (
+                        current_norm
+                        and audit_cutoff is not None
+                        and snapshot_updated_at is not None
+                        and snapshot_updated_at > audit_cutoff
+                    ):
+                        continue
                     if current_norm:
                         node_id = f"{field_name}:{current_norm}"
                         graph.add_node(node_id, node_type, current_raw, current_norm)
-                        graph.add_edge(user_node_id, node_id, f"OWNS_{node_type}")
+                        graph.add_edge(
+                            user_node_id, node_id, f"OWNS_{node_type}",
+                            valid_from=snapshot_updated_at,
+                            metadata={"source": "user_identities.csv"},
+                        )
                         if field_name == "email":
-                            graph.email_to_user_edges[current_norm].append((user_id, TimeWindow()))
+                            graph.email_to_user_edges[current_norm].append(
+                                (user_id, TimeWindow(valid_from=snapshot_updated_at))
+                            )
                 else:
                     # Reconstruct transition intervals:
                     # Initial value was valid from -infinity up to first event_time
                     first_ev = events[0]
-                    first_old_norm = normalize_email(first_ev["old_value"]) if field_name in ("email", "email_hash") else first_ev["old_value"].strip()
+                    first_old_norm = (
+                        normalize_email(first_ev["old_value"]) if field_name in ("email", "email_hash")
+                        else clean_phone_digits(first_ev["old_value"]) if field_name == "phone"
+                        else first_ev["old_value"].strip()
+                    )
                     if first_old_norm:
                         node_id = f"{field_name}:{first_old_norm}"
                         graph.add_node(node_id, node_type, first_ev["old_value"], first_old_norm)
@@ -308,7 +346,11 @@ class TemporalIdentityResolver:
                     for i in range(len(events) - 1):
                         curr_ev = events[i]
                         next_ev = events[i + 1]
-                        val_norm = normalize_email(curr_ev["new_value"]) if field_name in ("email", "email_hash") else curr_ev["new_value"].strip()
+                        val_norm = (
+                            normalize_email(curr_ev["new_value"]) if field_name in ("email", "email_hash")
+                            else clean_phone_digits(curr_ev["new_value"]) if field_name == "phone"
+                            else curr_ev["new_value"].strip()
+                        )
                         if val_norm:
                             node_id = f"{field_name}:{val_norm}"
                             graph.add_node(node_id, node_type, curr_ev["new_value"], val_norm)
@@ -327,7 +369,11 @@ class TemporalIdentityResolver:
 
                     # Latest transition: valid from last event_time to +infinity (or snapshot time)
                     last_ev = events[-1]
-                    last_val_norm = normalize_email(last_ev["new_value"]) if field_name in ("email", "email_hash") else last_ev["new_value"].strip()
+                    last_val_norm = (
+                        normalize_email(last_ev["new_value"]) if field_name in ("email", "email_hash")
+                        else clean_phone_digits(last_ev["new_value"]) if field_name == "phone"
+                        else last_ev["new_value"].strip()
+                    )
                     if last_val_norm:
                         node_id = f"{field_name}:{last_val_norm}"
                         graph.add_node(node_id, node_type, last_ev["new_value"], last_val_norm)
@@ -354,8 +400,8 @@ class TemporalIdentityResolver:
     ) -> Optional[ResolvedIdentity]:
         """
         Resolve a user's current and historical identity from the request email.
-        Applies temporal cutoff, locates owning user_id at requested_at, and
-        traverses the temporal identity graph using Breadth-First Search.
+        Applies temporal cutoffs and collects only identifiers directly owned
+        by the uniquely matched user_id.
         """
         norm_email = normalize_email(email)
         req_dt = parse_iso_timestamp(requested_at)
@@ -378,25 +424,24 @@ class TemporalIdentityResolver:
         if not candidate_edges:
             return None
 
-        # Filter candidate user_id by time window matching requested_at
+        # Resolve only a unique owner at requested_at. If no request time is
+        # available, accept the email only when it has never had multiple owners.
         selected_user_id: Optional[str] = None
-        for uid, tw in candidate_edges:
-            if tw.contains(req_dt):
-                selected_user_id = uid
-                break
-
-        # If no exact temporal match (e.g., requested_at is None), pick the single or latest user
-        if not selected_user_id and candidate_edges:
-            selected_user_id = candidate_edges[0][0]
+        if req_dt is not None:
+            matching_users = {uid for uid, window in candidate_edges if window.contains(req_dt)}
+            if len(matching_users) == 1:
+                selected_user_id = next(iter(matching_users))
+        else:
+            candidate_users = {uid for uid, _ in candidate_edges}
+            if len(candidate_users) == 1:
+                selected_user_id = next(iter(candidate_users))
 
         if not selected_user_id:
             return None
 
-        # 2. Temporal BFS Traversal from user node
+        # 2. Read only edges owned directly by the selected user. Traversing
+        # through a shared/recycled identifier could incorrectly join two users.
         start_node_id = f"user:{selected_user_id}"
-        visited_nodes: Set[str] = {start_node_id}
-        queue = deque([start_node_id])
-
         user_name = ""
         current_email = ""
         all_emails: Set[str] = set()
@@ -405,59 +450,41 @@ class TemporalIdentityResolver:
         all_hashes: Set[str] = set()
         intervals_summary: List[Dict[str, Any]] = []
 
-        while queue:
-            curr_id = queue.popleft()
-            curr_node = graph.nodes.get(curr_id)
-            if not curr_node:
+        for edge in graph.adj[start_node_id]:
+            if audit_dt is not None and edge.time_window.valid_from and edge.time_window.valid_from > audit_dt:
                 continue
+            target_node = graph.nodes.get(edge.target_id)
+            if not target_node:
+                continue
+            if target_node.node_type == "EMAIL":
+                all_emails.add(target_node.normalized_value)
+                if (
+                    edge.time_window.contains(audit_dt)
+                    if audit_dt is not None
+                    else edge.time_window.valid_to is None
+                ):
+                    current_email = target_node.value
+            elif target_node.node_type == "PHONE":
+                all_phones.add(target_node.value)
+                digits = target_node.normalized_value
+                if digits:
+                    phone_digits.add(digits)
+            elif target_node.node_type == "EMAIL_HASH":
+                # Only explicit hashes attached to this user are evidence.
+                all_hashes.add(target_node.normalized_value)
+            elif target_node.node_type == "NAME":
+                user_name = target_node.value
 
-            for edge in graph.adj[curr_id]:
-                target_id = edge.target_id
-                target_node = graph.nodes.get(target_id)
-                if not target_node:
-                    continue
-
-                # Ensure edge validity is bounded by audit_dt
-                if audit_dt is not None and edge.time_window.valid_from is not None:
-                    if edge.time_window.valid_from > audit_dt:
-                        # Skip edges that originated in the future past audit_at
-                        continue
-
-                # Record identifier details
-                if target_node.node_type == "EMAIL":
-                    all_emails.add(target_node.normalized_value)
-                    # Automatically compute SHA-256 for all emails
-                    all_hashes.add(compute_email_hash(target_node.normalized_value))
-                    if edge.time_window.valid_to is None:
-                        current_email = target_node.value
-
-                elif target_node.node_type == "PHONE":
-                    all_phones.add(target_node.value)
-                    digits = clean_phone_digits(target_node.value)
-                    if digits:
-                        phone_digits.add(digits)
-
-                elif target_node.node_type == "EMAIL_HASH":
-                    all_hashes.add(target_node.normalized_value)
-
-                elif target_node.node_type == "NAME":
-                    user_name = target_node.value
-
-                # Track temporal interval metadata
-                intervals_summary.append({
-                    "node_type": target_node.node_type,
-                    "value": target_node.value,
-                    "valid_from": edge.time_window.valid_from.isoformat() if edge.time_window.valid_from else None,
-                    "valid_to": edge.time_window.valid_to.isoformat() if edge.time_window.valid_to else None,
-                    "relation": edge.relation,
-                })
-
-                if target_id not in visited_nodes:
-                    visited_nodes.add(target_id)
-                    queue.append(target_id)
-
-        if not current_email and all_emails:
-            current_email = sorted(list(all_emails))[0]
+            intervals_summary.append({
+                "node_type": target_node.node_type,
+                "value": target_node.value,
+                "normalized_value": target_node.normalized_value,
+                "valid_from": edge.time_window.valid_from.isoformat() if edge.time_window.valid_from else None,
+                "valid_to": edge.time_window.valid_to.isoformat() if edge.time_window.valid_to else None,
+                "relation": edge.relation,
+                "audit_id": edge.metadata.get("audit_id", ""),
+                "source": edge.metadata.get("source", "user_audit_log.csv"),
+            })
 
         return ResolvedIdentity(
             user_id=selected_user_id,
@@ -508,7 +535,10 @@ def resolve_user_identity(
             "all_emails": [normalize_email(email)],
             "all_phones": [],
             "phone_digits": [],
-            "all_email_hashes": [compute_email_hash(email)],
+            "all_email_hashes": [],
+            "all_identifiers": [normalize_email(email)] if email else [],
+            "identifiers": [],
+            "unresolved_questions": ["No unique owner for the supplied email at requested_at."],
         }
 
     res_dict = resolved.to_dict()
